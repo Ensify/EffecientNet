@@ -3,121 +3,140 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
 from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
+from sklearn.metrics import precision_recall_curve, precision_score, recall_score
+import numpy as np
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train a PyTorch model.")
-    parser.add_argument('--dataset-path', type=str, required=True, help="Path to the dataset.")
-    parser.add_argument('--batch-size', type=int, default=4, help="Batch size for training.")
-    parser.add_argument('--img-height', type=int, default=384, help="Height of input images.")
-    parser.add_argument('--img-width', type=int, default=384, help="Width of input images.")
-    parser.add_argument('--validation-split', type=float, default=0.2, help="Fraction of data to use for validation.")
-    parser.add_argument('--num-epochs', type=int, default=1, help="Number of epochs to train.")
-    parser.add_argument('--learning-rate', type=float, default=0.001, help="Learning rate for the optimizer.")
-    parser.add_argument('--experiment-name', type=str, required=True, help="Name of the experiment.")
-    return parser.parse_args()
+def train(args):
+    # Create experiment directory
+    if not os.path.exists(args.experiment_dir):
+        os.makedirs(args.experiment_dir)
 
-def main():
-    args = parse_args()
-
-    # Create directory for the experiment
-    experiment_dir = os.path.join('experiments', args.experiment_name)
-    os.makedirs(experiment_dir, exist_ok=True)
-    
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Data loading and preprocessing
+    # Data transformations
     transform = transforms.Compose([
-        transforms.Resize((args.img_height, args.img_width)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    train_dataset = datasets.ImageFolder(os.path.join(args.dataset_path,"train"), transform=transform)
-    val_dataset = datasets.ImageFolder(os.path.join(args.dataset_path,"val"), transform=transform)
+    # Dataset and DataLoader
+    train_dataset = datasets.ImageFolder(root=os.path.join(args.dataset_dir, 'train'), transform=transform)
+    val_dataset = datasets.ImageFolder(root=os.path.join(args.dataset_dir, 'val'), transform=transform)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    # Print class indices
+    print("Class indices:", train_dataset.class_to_idx)
+    input("Verify class weights and press enter to train...")
 
-    # Model setup
-    model = models.efficientnet_v2_s(weights=None, num_classes=len(train_dataset.classes)).to(device)
+    # Model
+    model = models.efficientnet_v2_s(weights=None, num_classes = len(train_dataset.classes))
+    model.classifier[1] = nn.Linear(model.classifier[1].in_features, 2)  # Adjust for binary classification
+    model = model.to(args.device)
 
-    # Loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    # Loss function with class weights
+    class_weights = torch.tensor(args.class_weights, dtype=torch.float).to(args.device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    # Initialize metrics lists
+    # Training Loop
+    num_epochs = args.epochs
     train_losses = []
     val_losses = []
-    accuracies = []
+    val_precisions = []
+    val_recalls = []
+    best_val_loss = float('inf')
 
-    best_accuracy = 0
-
-    # Training loop
-    for epoch in range(args.num_epochs):
+    for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
+
+        for images, labels in train_loader:
+            images, labels = images.to(args.device), labels.to(args.device)
+
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            running_loss += loss.item()
 
-        avg_train_loss = running_loss / len(train_loader)
-        train_losses.append(avg_train_loss)
+            running_loss += loss.item() * images.size(0)
+            print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {running_loss}',end="\r")
 
-        # Validation loop
+        epoch_train_loss = running_loss / len(train_dataset)
+        train_losses.append(epoch_train_loss)
+
+        # Validation
         model.eval()
-        val_loss = 0
+        running_val_loss = 0.0
+        all_preds = []
+        all_labels = []
         correct = 0
         total = 0
         with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
+            for images, labels in val_loader:
+                images, labels = images.to(args.device), labels.to(args.device)
+                outputs = model(images)
                 loss = criterion(outputs, labels)
-                val_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
+                running_val_loss += loss.item() * images.size(0)
+
+                _, preds = torch.max(outputs, 1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
                 total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+                correct += (preds == labels).sum().item()
 
-        avg_val_loss = val_loss / len(val_loader)
+        epoch_val_loss = running_val_loss / len(val_dataset)
+        val_losses.append(epoch_val_loss)
+
         accuracy = 100 * correct / total
-        val_losses.append(avg_val_loss)
-        accuracies.append(accuracy)
 
-        print(f'Epoch {epoch+1}/{args.num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Accuracy: {accuracy:.2f}%')
+        # Calculate precision and recall
+        precision, recall, _ = precision_recall_curve(all_labels, all_preds)
+        val_precisions.append(np.mean(precision))
+        val_recalls.append(np.mean(recall))
 
-        # Save the model checkpoint if it's the best so far
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            torch.save(model.state_dict(), os.path.join(experiment_dir, 'model_best.pth'))
+        print(f'Epoch [{epoch + 1}/{num_epochs}], Train Loss: {epoch_train_loss:.4f}, Val Loss: {epoch_val_loss:.4f}, Precision: {val_precisions[-1]:.4f}, Recall: {val_recalls[-1]:.4f}, Accuracy: {accuracy}')
 
-        # Save the last model checkpoint
-        torch.save(model.state_dict(), os.path.join(experiment_dir, 'model_last.pth'))
+        # Save the best model
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            torch.save(model.state_dict(), os.path.join(args.experiment_dir, 'best_model.pth'))
 
-    # Plot training metrics
+        # Save the last model
+        torch.save(model.state_dict(), os.path.join(args.experiment_dir, 'last_model.pth'))
+
+    # Plot training and validation losses
     plt.figure()
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
+    plt.plot(range(1, num_epochs + 1), train_losses, marker='o', label='Training Loss')
+    plt.plot(range(1, num_epochs + 1), val_losses, marker='o', label='Validation Loss')
+    plt.title('Training and Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.title('Training and Validation Loss')
     plt.legend()
-    plt.savefig(os.path.join(experiment_dir, 'training_loss_plot.png'))
+    plt.savefig(os.path.join(args.experiment_dir, 'training_validation_loss.png'))
 
+    # Plot precision and recall
     plt.figure()
-    plt.plot(accuracies, label='Validation Accuracy')
+    plt.plot(range(1, num_epochs + 1), val_precisions, marker='o', label='Validation Precision')
+    plt.plot(range(1, num_epochs + 1), val_recalls, marker='o', label='Validation Recall')
+    plt.title('Validation Precision and Recall')
     plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.title('Validation Accuracy')
+    plt.ylabel('Score')
     plt.legend()
-    plt.savefig(os.path.join(experiment_dir, 'validation_accuracy_plot.png'))
+    plt.savefig(os.path.join(args.experiment_dir, 'precision_recall.png'))
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Train an EfficientNet model for binary classification.')
+    parser.add_argument('--dataset_dir', type=str, required=True, help='Path to dataset directory.')
+    parser.add_argument('--experiment_dir', type=str, required=True, help='Directory to save experiment results.')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size.')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate.')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of epochs.')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use for training.')
+    parser.add_argument('--class_weights', type=float, nargs=2, required=True, help='Class weights for loss function.')
+    args = parser.parse_args()
+
+    train(args)
