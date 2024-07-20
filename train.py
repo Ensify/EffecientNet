@@ -12,6 +12,18 @@ validation_split = 0.2
 num_classes = 2
 epochs = 1
 
+#list gpus
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Restrict TensorFlow to only use the first GPU
+        tf.config.experimental.set_visible_devices(gpus[0], 'GPU')
+    except RuntimeError as e:
+        print(e)
+
+input("Start training?")
+
 # Create a MirroredStrategy for distributed training
 strategy = tf.distribute.MirroredStrategy()
 
