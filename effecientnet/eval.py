@@ -1,83 +1,90 @@
 import argparse
+import os
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader
+from sklearn.metrics import precision_score, recall_score, confusion_matrix
 import matplotlib.pyplot as plt
-import os
+import seaborn as sns
+import numpy as np
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate a PyTorch model.")
-    parser.add_argument('--model-path', type=str, required=True, help="Path to the trained model file.")
-    parser.add_argument('--dataset-path', type=str, required=True, help="Path to the dataset.")
-    parser.add_argument('--batch-size', type=int, default=4, help="Batch size for evaluation.")
-    parser.add_argument('--img-height', type=int, default=384, help="Height of input images.")
-    parser.add_argument('--img-width', type=int, default=384, help="Width of input images.")
-    return parser.parse_args()
+def plot_confusion_matrix(cm, class_names, file_path):
+    """Plot and save confusion matrix."""
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.savefig(file_path)
+    plt.close()
 
-def main():
-    args = parse_args()
-    
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Data loading and preprocessing
+def evaluate(args):
+    # Data transformations
     transform = transforms.Compose([
-        transforms.Resize((args.img_height, args.img_width)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    dataset = datasets.ImageFolder(args.dataset_path, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    # Dataset and DataLoader
+    val_dataset = datasets.ImageFolder(root=os.path.join(args.dataset_dir), transform=transform)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    # Load model
-    model = models.efficientnet_v2_s(weights=None, num_classes=len(dataset.classes))
+    # Model
+    model = models.efficientnet_v2_s(weights=None, num_classes = len(val_dataset.classes))
+    model.classifier[1] = nn.Linear(model.classifier[1].in_features, 2)  # Adjust for binary classification
     model.load_state_dict(torch.load(args.model_path))
-    model = model.to(device)
+    model = model.to(args.device)
     model.eval()
 
-    # Evaluation
-    criterion = nn.CrossEntropyLoss()
-    val_loss = 0
-    correct = 0
-    total = 0
-    losses = []
-    accuracies = []
+    # Evaluate
+    all_preds = []
+    all_labels = []
 
     with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            val_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            
-            # Track loss and accuracy
-            losses.append(loss.item())
-            accuracies.append((predicted == labels).sum().item() / labels.size(0))
+        for images, labels in val_loader:
+            images, labels = images.to(args.device), labels.to(args.device)
+            outputs = model(images)
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
 
-    avg_loss = val_loss / len(dataloader)
-    accuracy = 100 * correct / total
-    print(f'Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%')
+    # Compute precision and recall
+    precision = precision_score(all_labels, all_preds, average='binary')
+    recall = recall_score(all_labels, all_preds, average='binary')
+    print(f'Precision: {precision:.4f}')
+    print(f'Recall: {recall:.4f}')
 
-    # Plot loss and accuracy
-    plt.figure()
-    plt.plot(losses, label='Loss')
-    plt.xlabel('Batch')
-    plt.ylabel('Loss')
-    plt.title('Loss vs. Batch')
-    plt.legend()
-    plt.savefig('loss_plot.png')
+    #Compute F1 Score
+    f1_score = 2 * (precision * recall) / (precision + recall)
+    print(f'F1 Score: {f1_score:.4f}')
 
-    plt.figure()
-    plt.plot(accuracies, label='Accuracy')
-    plt.xlabel('Batch')
-    plt.ylabel('Accuracy')
-    plt.title('Accuracy vs. Batch')
-    plt.legend()
-    plt.savefig('accuracy_plot.png')
+    # Compute confusion matrix
+    cm = confusion_matrix(all_labels, all_preds)
+    print('Confusion Matrix:')
+    print(cm)
+
+    # Plot and save confusion matrix
+    class_names = ['Defect', 'Normal']  # Adjust as per your dataset class names
+    plot_confusion_matrix(cm, class_names, os.path.join(args.experiment_dir, 'confusion_matrix.png'))
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Evaluate an EfficientNet model for binary classification.')
+    parser.add_argument('--dataset_dir', type=str, required=True, help='Path to dataset directory.')
+    parser.add_argument('--model_path', type=str, required=True, help='Path to saved model weights.')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size.')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use for evaluation.')
+    parser.add_argument('--experiment_dir', type=str, required=True, help='Directory to save evaluation results.')
+    args = parser.parse_args()
+
+    if not args.experiment_dir:
+        raise ValueError('You must provide --experiment_dir.')
+
+    # Ensure experiment directory exists
+    if not os.path.exists(args.experiment_dir):
+        os.makedirs(args.experiment_dir)
+
+    evaluate(args)
+
+#python effecientnet\eval.py --dataset_dir ..\DataProcess\datasets\classification\defect_classification\val --model_path effnet_1.pth --batch_size 4 --experiment_dir effnet_2

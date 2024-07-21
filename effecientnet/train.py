@@ -94,7 +94,8 @@ def train(args):
         accuracy = 100 * correct / total
 
         # Calculate precision and recall
-        precision, recall, _ = precision_recall_curve(all_labels, all_preds)
+        precision = precision_score(all_labels, all_preds)
+        recall = recall_score(all_labels, all_preds)
         val_precisions.append(np.mean(precision))
         val_recalls.append(np.mean(recall))
 
